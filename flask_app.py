@@ -2,7 +2,7 @@ import os
 import json
 import psycopg2
 import base64
-import time # timeモジュールをインポート
+import requests # ★★★ 実際のAPIコールに使用するために追加 ★★★
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -134,20 +134,17 @@ def get_feedback_by_email(email):
             conn.close()
 
 # -------------------------------------------------------------
-# Gemini API呼び出し関数
+# Gemini API呼び出し関数 (ペイロード構造を修正)
 # -------------------------------------------------------------
-# 🚨 実際には、'requests'ライブラリを使ったHTTP POSTリクエストが必要です。
-# ここでは、そのロジックを簡潔に示し、結果をシミュレートします。
 def call_gemini_api_for_stt_and_summary(base64_audio_data, prompt, mime_type):
     """
     Base64エンコードされた音声データを受け取り、Gemini APIを呼び出して
     STT（音声認識）と要約を同時に行います。
-    
-    注: この関数は、実際のAPIコールではなく、ロジックのプレースホルダーです。
     """
     print(f"🚀 Gemini APIに音声データ ({len(base64_audio_data)} bytes) を送信中...")
     
-    # 実際はここでrequests.postを使ってAPIを叩く
+    API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent"
+    
     gemini_api_key = os.environ.get('GEMINI_API_KEY')
     if not gemini_api_key:
         print("❌ GEMINI_API_KEYが設定されていません。STT/要約をスキップします。")
@@ -156,38 +153,96 @@ def call_gemini_api_for_stt_and_summary(base64_audio_data, prompt, mime_type):
             "summary": "要約なし"
         }
 
-    # APIコールロジックのシミュレーション（時間のかかる処理を模倣）
-    # 実際のGemini APIコール実装例 (要requestsライブラリ):
-    # import requests
-    # API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent"
-    # headers = {'Content-Type': 'application/json'}
-    # payload = {
-    #     "contents": [
-    #         {"parts": [{"text": prompt}]},
-    #         {"parts": [{"inlineData": {"mimeType": mime_type, "data": base64_audio_data}}]}
-    #     ],
-    #     "config": {"systemInstruction": {"parts": [{"text": "You are a helpful assistant."}]}}
-    # }
-    # response = requests.post(f"{API_URL}?key={gemini_api_key}", headers=headers, json=payload)
-    # result = response.json()
-    # ... 結果のパースとエラー処理 ...
+    headers = {'Content-Type': 'application/json'}
     
-    time.sleep(3) 
-
-    # 応答の構造をシミュレーション
-    simulated_stt_text = (
-        "「皆さん、このブースのデモは非常に革新的でした。特に、AIの応答速度が以前のバージョンより大幅に向上しているのを感じました。"
-        "しかし、インターフェースの色使いが少し暗く、もう少し明るいトーンにすると、来場者の注目を集めやすいでしょう。全体的には素晴らしい進化です。」"
-    )
-    simulated_summary = "AI応答速度の向上は評価されたが、インターフェースの色使いを明るくする改善の提案があった。"
-
-    return {
-        "stt_text": simulated_stt_text,
-        "summary": simulated_summary
+    # ★★★ 修正箇所: systemInstructionとtoolsをトップレベルに移動 ★★★
+    payload = {
+        # 1. コンテンツ (プロンプトとオーディオ)
+        "contents": [
+            {
+                "parts": [
+                    # A. プロンプト (テキスト)
+                    {"text": prompt},
+                    # B. オーディオデータ (マルチモーダル)
+                    {"inlineData": {"mimeType": mime_type, "data": base64_audio_data}}
+                ]
+            }
+        ],
+        
+        # 2. システム指示 (トップレベルに移動)
+        "systemInstruction": {
+            "parts": [{"text": "You are a professional feedback analyst. Accurately transcribe the audio content (STT) and then summarize the key feedback (positive points and suggestions) in Japanese, under 30 characters."}]
+        },
+        
+        # 3. ツール (トップレベルに移動)
+        "tools": [{"google_search": {} }] 
+        # configキー自体は削除
     }
+    # ★★★ 修正箇所ここまで ★★★
+
+    try:
+        # APIキーを使ってリクエストを送信
+        response = requests.post(
+            f"{API_URL}?key={gemini_api_key}", 
+            headers=headers, 
+            json=payload,
+            timeout=30 # タイムアウトを設定
+        )
+        response.raise_for_status() # HTTPエラーコード（4xx, 5xx）を検出
+
+        result = response.json()
+        
+        # 応答のパース
+        generated_text = result.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', '')
+        
+        if not generated_text:
+            raise Exception("Gemini APIからの応答テキストが空でした。")
+
+        # シンプルなロジックでSTTと要約を分離
+        # 生成されたテキスト全体を STT結果として採用
+        stt_text = generated_text
+        
+        # 要約は、生成されたテキストの最初の30文字を暫定的に使用（プロンプトの指示に依存）
+        summary_text = stt_text.split('\n')[0][:30].strip()
+        if not summary_text:
+             summary_text = stt_text.strip()[:30]
+
+
+        print("✅ Gemini APIからの応答を受信しました。")
+        return {
+            "stt_text": stt_text,
+            "summary": summary_text
+        }
+
+    except requests.exceptions.HTTPError as http_err:
+        status_code = http_err.response.status_code if http_err.response is not None else "Unknown"
+        print(f"❌ HTTPエラーが発生しました: {http_err} (Status: {status_code})")
+        # エラー詳細をより詳しくログに出力
+        try:
+             error_response = http_err.response.json()
+             error_detail = f"APIエラー: {error_response.get('error', {}).get('message', '詳細不明')} (Status: {status_code})"
+        except:
+             error_detail = http_err.response.text[:100] if http_err.response else "API応答なし"
+
+        return {
+            "stt_text": f"【STTエラー: HTTP {status_code}】",
+            "summary": f"APIエラー: {error_detail}..."
+        }
+    except requests.exceptions.RequestException as req_err:
+        print(f"❌ リクエストエラーが発生しました: {req_err}")
+        return {
+            "stt_text": f"【STTエラー: ネットワーク接続】",
+            "summary": f"ネットワークエラー: {req_err}"
+        }
+    except Exception as e:
+        print(f"❌ 応答パースエラー: {e}")
+        return {
+            "stt_text": f"【STTエラー: 応答解析失敗】",
+            "summary": f"応答解析エラー: {e}"
+        }
 
 # -------------------------------------------------------------
-# 新規エンドポイント: POST /api/process_audio
+# 新規エンドポイント: POST /api/process_audio (変更なし)
 # -------------------------------------------------------------
 @app.route('/api/process_audio', methods=['POST'])
 def process_audio():
@@ -208,17 +263,14 @@ def process_audio():
         return jsonify({"message": "❌ 必須データ（audio_data, mime_type, booth_id）が不足しています"}), 400
 
     # 1. Gemini API呼び出し用のプロンプトを作成
-    system_prompt = (
-        f"あなたはプロのフィードバックアナリストです。以下の音声を正確にテキスト化（STT）し、"
-        f"次に、そのテキストの内容を元に、ブースID {booth_id} に対する評価サマリー（良かった点と改善点）を"
-        f"最大30文字で簡潔にまとめてください。"
-    )
+    # システム指示はcall_gemini_api_for_stt_and_summary関数内でより具体的に指定するため、ここでは単にタスクを指示
+    prompt_text = f"ブースID {booth_id} へのフィードバックをテキスト化し、要約してください。"
     
     try:
-        # 2. Gemini APIを呼び出し（ここではシミュレーション）
+        # 2. Gemini APIを呼び出し（ここでは実処理）
         gemini_result = call_gemini_api_for_stt_and_summary(
             base64_audio, 
-            system_prompt, 
+            prompt_text, # 以前のsystem_promptをprompt_textとして渡す
             mime_type
         )
         

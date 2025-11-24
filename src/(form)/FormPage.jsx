@@ -65,8 +65,9 @@ const FeedbackForm = ({ onSubmit }) => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
 
-      // MediaRecorderの設定: audio/L16はPCM 16bitで、多くのAPIがサポートしています
-      const options = { mimeType: "audio/webm;codecs=pcm" };
+      // ★★★ 修正箇所: mimeTypeを audio/webm;codecs=opus に変更 ★★★
+      // WebMコンテナ内のOpusコーデックは、多くのAPIで安定してサポートされています。
+      const options = { mimeType: "audio/webm;codecs=opus" };
       const mediaRecorder = new MediaRecorder(stream, options);
 
       mediaRecorderRef.current = mediaRecorder;
@@ -89,8 +90,9 @@ const FeedbackForm = ({ onSubmit }) => {
             "（音声処理中...）サーバーに送信し、AIでテキスト化しています。数秒お待ちください。",
         }));
 
+        // Blob作成時も新しいMIME Typeを使用
         const audioBlob = new Blob(audioChunksRef.current, {
-          type: "audio/webm;codecs=pcm",
+          type: options.mimeType,
         });
 
         // BlobからBase64文字列に変換
