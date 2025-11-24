@@ -1,20 +1,31 @@
-import React, { useState } from "react";
-
-// lucide-react の代わりにインラインSVGを使用します。
+import React, { useState, useRef } from "react";
 
 // =================================================================
-// FeedbackForm コンポーネント (App.jsx内に統合)
+// FeedbackForm Component
 // =================================================================
+
 const FeedbackForm = ({ onSubmit }) => {
   const [formData, setFormData] = useState({
     booth_id: "",
-    praise_ratio: "50", // 50% を初期値
-    advice_ratio: "50",
     raw_text: "",
-    visitor_attribute: "industry_professional", // 業界関係者を初期値
+    visitor_attribute: "industry_professional", // 初期値
   });
 
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isProcessingAudio, setIsProcessingAudio] = useState(false); // 音声処理中のステート
+
+  // 録音関連のステートと参照
+  const [isRecording, setIsRecording] = useState(false);
+  const mediaRecorderRef = useRef(null);
+  const audioChunksRef = useRef([]);
+
+  const customAlert = (message) => {
+    // alert()の代わりにconsoleに出力
+    console.log("App Message:", message);
+    // ユーザーに視覚的に通知するため、簡略化のためwindow.alertを使用
+    // 実際のアプリケーションでは、カスタムモーダルを使用してください。
+    window.alert(message);
+  };
 
   const handleChange = (e) => {
     const { name, value } = e.target;
@@ -23,35 +34,140 @@ const FeedbackForm = ({ onSubmit }) => {
 
   const handleSubmit = (e) => {
     e.preventDefault();
-    if (isSubmitting) return;
+    if (isSubmitting || isProcessingAudio) return;
 
     if (
       !formData.booth_id ||
       !formData.raw_text ||
       !formData.visitor_attribute
     ) {
-      alert("必須項目をすべて入力してください。");
+      customAlert("必須項目をすべて入力してください。");
       return;
     }
 
+    // API互換性のために固定値で送信
+    const dataToSend = {
+      ...formData,
+      praise_ratio: "50",
+      advice_ratio: "50",
+    };
+
     setIsSubmitting(true);
-    // onSubmitの非同期処理が完了したら、App.jsx側でisSubmittingを解除する
-    onSubmit(() => setIsSubmitting(false), formData);
+    // onSubmitの非同期処理が完了したら、isSubmittingを解除
+    onSubmit(() => setIsSubmitting(false), dataToSend);
   };
 
-  // praise_ratioとadvice_ratioが連動するように調整
-  const handlePraiseChange = (e) => {
-    const praise = Number(e.target.value);
-    const advice = 100 - praise;
-    setFormData((prev) => ({
-      ...prev,
-      praise_ratio: String(praise),
-      advice_ratio: String(advice),
-    }));
+  // ====== 音声認識機能の追加 ======
+
+  const startRecording = async () => {
+    if (isRecording || isProcessingAudio) return;
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+      // MediaRecorderの設定: audio/L16はPCM 16bitで、多くのAPIがサポートしています
+      const options = { mimeType: "audio/webm;codecs=pcm" };
+      const mediaRecorder = new MediaRecorder(stream, options);
+
+      mediaRecorderRef.current = mediaRecorder;
+      audioChunksRef.current = []; // チャンクをリセット
+
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          audioChunksRef.current.push(event.data);
+        }
+      };
+
+      mediaRecorder.onstop = async () => {
+        // 録音データのストリームを閉じる
+        stream.getTracks().forEach((track) => track.stop());
+
+        setIsProcessingAudio(true);
+        setFormData((prev) => ({
+          ...prev,
+          raw_text:
+            "（音声処理中...）サーバーに送信し、AIでテキスト化しています。数秒お待ちください。",
+        }));
+
+        const audioBlob = new Blob(audioChunksRef.current, {
+          type: "audio/webm;codecs=pcm",
+        });
+
+        // BlobからBase64文字列に変換
+        const reader = new FileReader();
+        reader.readAsDataURL(audioBlob);
+        reader.onloadend = async () => {
+          const base64Audio = reader.result.split(",")[1]; // 'data:audio/...' のヘッダーを削除
+
+          const API_URL = "http://localhost:5000/api/process_audio";
+
+          try {
+            const response = await fetch(API_URL, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                audio_data: base64Audio,
+                mime_type: options.mimeType,
+                booth_id: formData.booth_id || "UNKNOWN", // ブースIDも送信
+              }),
+            });
+
+            const result = await response.json();
+
+            if (response.ok) {
+              setFormData((prev) => ({
+                ...prev,
+                raw_text: result.stt_text,
+              }));
+              customAlert(`音声処理成功: 要約: ${result.summary_text}`);
+            } else {
+              customAlert(
+                `音声処理エラー: ${result.message || "不明なエラー"}`
+              );
+              setFormData((prev) => ({
+                ...prev,
+                raw_text:
+                  "音声処理エラーが発生しました。手動で入力してください。",
+              }));
+            }
+          } catch (error) {
+            customAlert("ネットワークエラー: サーバーに接続できませんでした。");
+            console.error("Fetch Error:", error);
+            setFormData((prev) => ({
+              ...prev,
+              raw_text:
+                "ネットワークエラーが発生しました。手動で入力してください。",
+            }));
+          } finally {
+            setIsProcessingAudio(false);
+          }
+        };
+      };
+
+      mediaRecorder.start();
+      setIsRecording(true);
+      // 録音開始中はテキストエリアにメッセージを表示
+      setFormData((prev) => ({
+        ...prev,
+        raw_text: "（録音中...）終了したら「ストップ」を押してください。",
+      }));
+    } catch (err) {
+      customAlert(
+        "マイクへのアクセスに失敗しました。ブラウザの設定を確認してください。"
+      );
+      console.error("マイクへのアクセスに失敗しました:", err);
+    }
   };
 
-  // SVGアイコン定義
-  const ThumbsUp = (props) => (
+  const stopRecording = () => {
+    if (!isRecording || !mediaRecorderRef.current) return;
+
+    mediaRecorderRef.current.stop();
+    setIsRecording(false);
+  };
+
+  // SVGアイコン定義 (変更なし)
+  const MicIcon = (props) => (
     <svg
       {...props}
       xmlns="http://www.w3.org/2000/svg"
@@ -64,223 +180,202 @@ const FeedbackForm = ({ onSubmit }) => {
       strokeLinecap="round"
       strokeLinejoin="round"
     >
-      <path d="M7 10v12h12a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-3l2-4H5a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h2v-8h12"></path>
-    </svg>
-  );
-  const ThumbsDown = (props) => (
-    <svg
-      {...props}
-      xmlns="http://www.w3.org/2000/svg"
-      width="24"
-      height="24"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-    >
-      <path d="M17 14V2H5a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h3l-2 4h12a2 2 0 0 0 2-2v-10a2 2 0 0 0-2-2h-2v8h-7"></path>
-    </svg>
-  );
-  const UserIcon = (props) => (
-    <svg
-      {...props}
-      xmlns="http://www.w3.org/2000/svg"
-      width="24"
-      height="24"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-    >
-      <path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2" />
-      <circle cx="12" cy="7" r="4" />
-    </svg>
-  );
-  const MonitorIcon = (props) => (
-    <svg
-      {...props}
-      xmlns="http://www.w3.org/2000/svg"
-      width="24"
-      height="24"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-    >
-      <rect x="2" y="3" width="20" height="14" rx="2" />
-      <line x1="8" y1="21" x2="16" y2="21" />
-      <line x1="12" y1="17" x2="12" y2="21" />
-    </svg>
-  );
-  const HashIcon = (props) => (
-    <svg
-      {...props}
-      xmlns="http://www.w3.org/2000/svg"
-      width="24"
-      height="24"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-    >
-      <line x1="4" y1="9" x2="20" y2="9" />
-      <line x1="4" y1="15" x2="20" y2="15" />
-      <line x1="10" y1="3" x2="8" y2="21" />
-      <line x1="16" y1="3" x2="14" y2="21" />
+      <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z" />
+      <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+      <line x1="12" y1="19" x2="12" y2="22" />
     </svg>
   );
 
-  // Visitor Attributeのオプション
+  const StopIcon = (props) => (
+    <svg
+      {...props}
+      xmlns="http://www.w3.org/2000/svg"
+      width="24"
+      height="24"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+    </svg>
+  );
+
+  // Visitor Attributeのオプション (変更なし)
   const attributeOptions = [
-    {
-      value: "industry_professional",
-      label: "業界関係者",
-      icon: <UserIcon className="w-5 h-5" />,
-    },
-    {
-      value: "student",
-      label: "学生",
-      icon: <MonitorIcon className="w-5 h-5" />,
-    },
-    {
-      value: "general_visitor",
-      label: "一般来場者",
-      icon: <HashIcon className="w-5 h-5" />,
-    },
+    { value: "industry_professional", label: "業界関係者" },
+    { value: "student", label: "学生" },
+    { value: "general_visitor", label: "一般来場者" },
   ];
 
   return (
-    <form onSubmit={handleSubmit} className="space-y-6">
-      {/* Booth ID */}
+    <form onSubmit={handleSubmit} className="space-y-8 p-2">
+      {/* Visitor Attribute (属性) */}
+      <div>
+        <label
+          htmlFor="visitor_attribute"
+          className="block text-xl font-bold text-gray-800 mb-2"
+        >
+          属性
+        </label>
+        <div className="relative">
+          <select
+            name="visitor_attribute"
+            id="visitor_attribute"
+            value={formData.visitor_attribute}
+            onChange={handleChange}
+            required
+            className="block w-full pl-4 pr-10 py-3 text-lg border border-gray-300 rounded-xl shadow-inner focus:ring-indigo-500 focus:border-indigo-500 appearance-none bg-white"
+          >
+            {attributeOptions.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+          {/* ドロップダウン矢印 */}
+          <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-2 text-gray-700">
+            <svg
+              className="w-5 h-5"
+              fill="none"
+              stroke="currentColor"
+              viewBox="0 0 24 24"
+              xmlns="http://www.w3.org/2000/svg"
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth="2"
+                d="M19 9l-7 7-7-7"
+              ></path>
+            </svg>
+          </div>
+        </div>
+      </div>
+
+      {/* Booth ID (ブース番号) */}
       <div>
         <label
           htmlFor="booth_id"
-          className="block text-sm font-medium text-gray-700 flex items-center mb-1"
+          className="block text-xl font-bold text-gray-800 mb-2"
         >
-          <HashIcon className="w-4 h-4 mr-2" />
-          ブースID (例: A01)
+          ブース番号
         </label>
-        <input
-          type="text"
-          name="booth_id"
-          id="booth_id"
-          value={formData.booth_id}
-          onChange={handleChange}
-          required
-          className="mt-1 block w-full px-4 py-2 border border-gray-300 rounded-xl shadow-sm focus:ring-indigo-500 focus:border-indigo-500"
-          placeholder="例: A01"
-        />
-      </div>
-
-      {/* Visitor Attribute */}
-      <div>
-        <label className="block text-sm font-medium text-gray-700 flex items-center mb-2">
-          <UserIcon className="w-4 h-4 mr-2" />
-          来場者の属性
-        </label>
-        <div className="mt-1 grid grid-cols-3 gap-3">
-          {attributeOptions.map((option) => (
-            <label
-              key={option.value}
-              className="flex items-center space-x-2 cursor-pointer"
+        <div className="relative">
+          <input
+            type="text"
+            name="booth_id"
+            id="booth_id"
+            value={formData.booth_id}
+            onChange={handleChange}
+            required
+            className="block w-full px-4 py-3 text-lg border border-gray-300 rounded-xl shadow-inner focus:ring-indigo-500 focus:border-indigo-500"
+            placeholder="例: A01"
+          />
+          {/* ドロップダウン矢印 (画像にドロップダウンのように見えたため、ダミーで配置) */}
+          <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-2 text-gray-700">
+            <svg
+              className="w-5 h-5"
+              fill="none"
+              stroke="currentColor"
+              viewBox="0 0 24 24"
+              xmlns="http://www.w3.org/2000/svg"
             >
-              <input
-                type="radio"
-                name="visitor_attribute"
-                value={option.value}
-                checked={formData.visitor_attribute === option.value}
-                onChange={handleChange}
-                required
-                className="h-4 w-4 text-indigo-600 border-gray-300 focus:ring-indigo-500"
-              />
-              <span className="text-sm font-medium text-gray-700 flex items-center">
-                {option.icon}
-                <span className="ml-1">{option.label}</span>
-              </span>
-            </label>
-          ))}
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth="2"
+                d="M19 9l-7 7-7-7"
+              ></path>
+            </svg>
+          </div>
         </div>
       </div>
 
-      {/* Praise / Advice Ratio Slider */}
+      {/* 録音セクション */}
+      <div className="pt-4">
+        <label className="block text-xl font-bold text-gray-800 mb-3">
+          録音
+        </label>
+        <div className="flex space-x-4">
+          <button
+            type="button"
+            onClick={startRecording}
+            // 録音中または音声処理中は無効
+            disabled={isRecording || isProcessingAudio}
+            className={`flex-1 py-3 px-4 rounded-xl font-bold text-white transition duration-150 shadow-md flex items-center justify-center ${
+              isRecording
+                ? "bg-red-500 animate-pulse" // 録音中は赤く点滅
+                : isProcessingAudio
+                ? "bg-gray-500 cursor-not-allowed" // 処理中は灰色
+                : "bg-green-600 hover:bg-green-700" // 通常は緑
+            }`}
+          >
+            <MicIcon className="w-5 h-5 mr-2" />
+            {isRecording ? "録音中..." : "スタート"}
+          </button>
+          <button
+            type="button"
+            onClick={stopRecording}
+            // 録音中で、かつ音声処理中でない場合のみ有効
+            disabled={!isRecording || isProcessingAudio}
+            className={`flex-1 py-3 px-4 rounded-xl font-bold transition duration-150 shadow-md flex items-center justify-center ${
+              !isRecording
+                ? "bg-gray-400 cursor-not-allowed text-gray-700"
+                : "bg-red-600 hover:bg-red-700 text-white"
+            }`}
+          >
+            <StopIcon className="w-5 h-5 mr-2" />
+            ストップ
+          </button>
+        </div>
+        {isProcessingAudio && (
+          <div className="mt-2 text-center text-sm font-medium text-indigo-600">
+            AIが音声をテキスト化中...
+          </div>
+        )}
+      </div>
+
+      {/* Raw Text Feedback (録音結果表示エリア) */}
       <div className="pt-2">
-        <label className="block text-sm font-medium text-gray-700 mb-3">
-          フィードバックの比率
-        </label>
-        <div className="flex justify-between items-center text-sm font-semibold mb-2">
-          <span className="text-green-600 flex items-center">
-            <ThumbsUp className="w-4 h-4 mr-1" />
-            褒める ({formData.praise_ratio}%)
-          </span>
-          <span className="text-red-600 flex items-center">
-            アドバイス ({formData.advice_ratio}%)
-            <ThumbsDown className="w-4 h-4 ml-1" />
-          </span>
-        </div>
-        <input
-          type="range"
-          name="praise_ratio"
-          min="0"
-          max="100"
-          step="5"
-          value={formData.praise_ratio}
-          onChange={handlePraiseChange}
-          className="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer range-lg"
-          style={{
-            background: `linear-gradient(to right, #10B981 0%, #10B981 ${formData.praise_ratio}%, #EF4444 ${formData.praise_ratio}%, #EF4444 100%)`,
-          }}
-        />
-      </div>
-
-      {/* Raw Text Feedback */}
-      <div>
-        <label
-          htmlFor="raw_text"
-          className="block text-sm font-medium text-gray-700 mb-1"
-        >
-          詳細なフィードバック (AI解析用)
-        </label>
         <textarea
           name="raw_text"
           id="raw_text"
-          rows="4"
+          rows="8"
           value={formData.raw_text}
           onChange={handleChange}
           required
-          className="mt-1 block w-full px-4 py-3 border border-gray-300 rounded-xl shadow-sm focus:ring-indigo-500 focus:border-indigo-500"
-          placeholder="良かった点や改善点などを詳しく記述してください。"
+          // 音声処理中はテキストエリアを無効化
+          disabled={isProcessingAudio}
+          className="block w-full px-4 py-3 text-lg border border-gray-300 rounded-xl shadow-inner focus:ring-indigo-500 focus:border-indigo-500 bg-white placeholder-gray-500"
+          placeholder="録音されたフィードバックがテキスト化されてここに入ります。必要に応じて直接編集も可能です。"
         ></textarea>
       </div>
 
-      {/* Submit Button */}
+      {/* Submit Button (送信) */}
       <button
         type="submit"
-        className={`w-full py-3 px-4 rounded-xl font-semibold text-white transition duration-150 shadow-md ${
-          isSubmitting
+        className={`w-full py-4 px-4 rounded-xl text-xl font-bold text-white transition duration-150 shadow-lg mt-8 ${
+          isSubmitting || isProcessingAudio // 音声処理中も送信を無効化
             ? "bg-gray-400 cursor-not-allowed"
             : "bg-indigo-600 hover:bg-indigo-700"
         }`}
-        disabled={isSubmitting}
+        disabled={isSubmitting || isProcessingAudio}
       >
-        {isSubmitting ? "送信中..." : "評価をデータベースに送信"}
+        {isSubmitting ? "送信中..." : "送信"}
       </button>
     </form>
   );
 };
+
 // =================================================================
-// End of FeedbackForm
+// FormPage Component (変更なし)
 // =================================================================
 
 const FormPage = () => {
-  const [activeScreen, setActiveScreen] = useState("form"); // 'form' or 'dashboard'
+  const [activeScreen, setActiveScreen] = useState("form");
 
   // ダッシュボードデータの仮置き場（GET APIが完成したら置き換え）
   const dummyDashboardData = {
@@ -298,8 +393,12 @@ const FormPage = () => {
     // フォームデータを受け取り、データベースに送信する処理
     console.log("フォームデータ:", formData);
 
-    // 🚨 修正: API URLをFlaskサーバーへ戻す
     const API_URL = "http://localhost:5000/api/submit_feedback";
+
+    const customAlert = (message) => {
+      console.log("Custom Alert:", message);
+      window.alert(message);
+    };
 
     const submitData = async () => {
       try {
@@ -317,7 +416,9 @@ const FormPage = () => {
           console.log(
             `評価送信成功: ${result.message} (ID: ${result.inserted_id})`
           );
-          alert(`評価送信成功: ${result.message} (ID: ${result.inserted_id})`);
+          customAlert(
+            `評価送信成功: ${result.message} (ID: ${result.inserted_id})`
+          );
           // 成功後、ダッシュボード画面へ移行
           setActiveScreen("dashboard");
         } else {
@@ -327,14 +428,16 @@ const FormPage = () => {
               result.error_detail || ""
             }`
           );
-          alert(
+          customAlert(
             `評価送信エラー: ${result.message}\n詳細: ${
               result.error_detail || ""
             }`
           );
         }
       } catch (error) {
-        alert("ネットワークエラーまたはサーバー接続エラーが発生しました。");
+        customAlert(
+          "ネットワークエラーまたはサーバー接続エラーが発生しました。"
+        );
         console.error("Fetch Error:", error);
       } finally {
         // 送信が完了したことをFeedbackFormに通知
@@ -348,11 +451,7 @@ const FormPage = () => {
   const renderScreen = () => {
     if (activeScreen === "form") {
       return (
-        <div className="p-4 md:p-8 bg-white shadow-xl rounded-2xl w-full max-w-2xl">
-          <h1 className="text-3xl font-extrabold text-gray-800 mb-6 border-b pb-2">
-            ブース評価フォーム (Flaskテスト版)
-          </h1>
-          {/* 統合されたFeedbackFormコンポーネントを使用 */}
+        <div className="p-4 md:p-8 bg-white shadow-xl rounded-2xl w-full max-w-lg mx-auto">
           <FeedbackForm onSubmit={handleFormSubmit} />
         </div>
       );

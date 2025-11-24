@@ -1,0 +1,4 @@
+Flask
+google-cloud-speech
+google-genai
+flask-cors
