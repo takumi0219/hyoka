@@ -13,6 +13,7 @@ const FeedbackForm = ({ onSubmit }) => {
 
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isProcessingAudio, setIsProcessingAudio] = useState(false); // 音声処理中のステート
+  const [isGeneratingSummary, setIsGeneratingSummary] = useState(false); // ★★★ 追加: 要約生成中のステート ★★★
 
   // 録音関連のステートと参照
   const [isRecording, setIsRecording] = useState(false);
@@ -32,27 +33,72 @@ const FeedbackForm = ({ onSubmit }) => {
     setFormData((prev) => ({ ...prev, [name]: value }));
   };
 
-  const handleSubmit = (e) => {
+  // ★★★ 修正箇所: handleSubmit関数 - 要約生成とデータベース送信を統合 ★★★
+  const handleSubmit = async (e) => {
     e.preventDefault();
-    if (isSubmitting || isProcessingAudio) return;
 
-    if (
-      !formData.booth_id ||
-      !formData.raw_text ||
-      !formData.visitor_attribute
-    ) {
-      customAlert("必須項目をすべて入力してください。");
+    // 処理中の場合は何もしない
+    if (isSubmitting || isProcessingAudio || isGeneratingSummary) return;
+
+    if (!formData.booth_id || !formData.visitor_attribute) {
+      customAlert("必須項目（属性とブース番号）をすべて入力してください。");
       return;
     }
 
-    // API互換性のために固定値で送信
+    const rawText = formData.raw_text.trim();
+    if (!rawText) {
+      customAlert(
+        "フィードバックテキストが空です。入力するか、録音してください。"
+      );
+      return;
+    }
+
+    setIsSubmitting(true);
+    setIsGeneratingSummary(true); // 要約生成を開始
+    let summaryText = "";
+
+    try {
+      customAlert("要約を生成しています。しばらくお待ちください...");
+      const API_URL_SUMMARY = "http://localhost:5000/api/generate_summary";
+
+      // 1. 要約生成APIを呼び出し
+      const summaryResponse = await fetch(API_URL_SUMMARY, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ raw_text: rawText }),
+      });
+
+      const summaryResult = await summaryResponse.json();
+
+      if (summaryResponse.ok) {
+        summaryText = summaryResult.summary_text;
+        console.log(`要約生成成功: ${summaryText}`);
+      } else {
+        // 要約生成に失敗した場合は、エラーメッセージをSummaryとして保存し、警告する
+        summaryText = `【要約エラー: ${
+          summaryResult.message || "不明なエラー"
+        } 詳細: ${summaryResult.error_detail || ""}}`;
+        customAlert(
+          `要約生成エラー: ${summaryResult.message || "不明なエラー"}`
+        );
+      }
+    } catch (error) {
+      summaryText = `【要約エラー: ネットワーク接続】`;
+      customAlert("要約生成中にネットワークエラーが発生しました。");
+      console.error("Summary Fetch Error:", error);
+    } finally {
+      setIsGeneratingSummary(false); // 要約生成を終了
+    }
+
+    // 2. データベースに送信
     const dataToSend = {
       ...formData,
+      raw_text: rawText, // 編集後のテキストを使用
+      summary_text: summaryText, // 生成した要約を追加
       praise_ratio: "50",
       advice_ratio: "50",
     };
 
-    setIsSubmitting(true);
     // onSubmitの非同期処理が完了したら、isSubmittingを解除
     onSubmit(() => setIsSubmitting(false), dataToSend);
   };
@@ -60,13 +106,12 @@ const FeedbackForm = ({ onSubmit }) => {
   // ====== 音声認識機能の追加 ======
 
   const startRecording = async () => {
-    if (isRecording || isProcessingAudio) return;
+    // 録音中、音声処理中、要約生成中は開始できない
+    if (isRecording || isProcessingAudio || isGeneratingSummary) return;
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
 
-      // ★★★ 修正箇所: mimeTypeを audio/webm;codecs=opus に変更 ★★★
-      // WebMコンテナ内のOpusコーデックは、多くのAPIで安定してサポートされています。
       const options = { mimeType: "audio/webm;codecs=opus" };
       const mediaRecorder = new MediaRecorder(stream, options);
 
@@ -79,8 +124,9 @@ const FeedbackForm = ({ onSubmit }) => {
         }
       };
 
+      // ★★★ 修正箇所: mediaRecorder.onstop の処理を STTのみに変更 ★★★
       mediaRecorder.onstop = async () => {
-        // 録音データのストリームを閉じる
+        // ストリームを閉じる
         stream.getTracks().forEach((track) => track.stop());
 
         setIsProcessingAudio(true);
@@ -90,7 +136,7 @@ const FeedbackForm = ({ onSubmit }) => {
             "（音声処理中...）サーバーに送信し、AIでテキスト化しています。数秒お待ちください。",
         }));
 
-        // Blob作成時も新しいMIME Typeを使用
+        const options = { mimeType: "audio/webm;codecs=opus" };
         const audioBlob = new Blob(audioChunksRef.current, {
           type: options.mimeType,
         });
@@ -121,10 +167,15 @@ const FeedbackForm = ({ onSubmit }) => {
                 ...prev,
                 raw_text: result.stt_text,
               }));
-              customAlert(`音声処理成功: 要約: ${result.summary_text}`);
+              // ★★★ 修正: STTが完了したことと、次のアクションをユーザーに指示 ★★★
+              customAlert(
+                "音声のテキスト化が完了しました。内容を確認し、「送信」を押して要約を生成・保存してください。"
+              );
             } else {
               customAlert(
-                `音声処理エラー: ${result.message || "不明なエラー"}`
+                `音声処理エラー: ${result.message || "不明なエラー"}\n詳細: ${
+                  result.error_detail || ""
+                }`
               );
               setFormData((prev) => ({
                 ...prev,
@@ -305,12 +356,12 @@ const FeedbackForm = ({ onSubmit }) => {
           <button
             type="button"
             onClick={startRecording}
-            // 録音中または音声処理中は無効
-            disabled={isRecording || isProcessingAudio}
+            // 録音中、音声処理中、要約生成中は無効
+            disabled={isRecording || isProcessingAudio || isGeneratingSummary}
             className={`flex-1 py-3 px-4 rounded-xl font-bold text-white transition duration-150 shadow-md flex items-center justify-center ${
               isRecording
                 ? "bg-red-500 animate-pulse" // 録音中は赤く点滅
-                : isProcessingAudio
+                : isProcessingAudio || isGeneratingSummary
                 ? "bg-gray-500 cursor-not-allowed" // 処理中は灰色
                 : "bg-green-600 hover:bg-green-700" // 通常は緑
             }`}
@@ -321,8 +372,8 @@ const FeedbackForm = ({ onSubmit }) => {
           <button
             type="button"
             onClick={stopRecording}
-            // 録音中で、かつ音声処理中でない場合のみ有効
-            disabled={!isRecording || isProcessingAudio}
+            // 録音中で、かつ音声処理中、要約生成中でない場合のみ有効
+            disabled={!isRecording || isProcessingAudio || isGeneratingSummary}
             className={`flex-1 py-3 px-4 rounded-xl font-bold transition duration-150 shadow-md flex items-center justify-center ${
               !isRecording
                 ? "bg-gray-400 cursor-not-allowed text-gray-700"
@@ -333,9 +384,11 @@ const FeedbackForm = ({ onSubmit }) => {
             ストップ
           </button>
         </div>
-        {isProcessingAudio && (
+        {(isProcessingAudio || isGeneratingSummary) && (
           <div className="mt-2 text-center text-sm font-medium text-indigo-600">
-            AIが音声をテキスト化中...
+            {isProcessingAudio
+              ? "AIが音声をテキスト化中..."
+              : "AIが要約を生成中..."}
           </div>
         )}
       </div>
@@ -349,8 +402,8 @@ const FeedbackForm = ({ onSubmit }) => {
           value={formData.raw_text}
           onChange={handleChange}
           required
-          // 音声処理中はテキストエリアを無効化
-          disabled={isProcessingAudio}
+          // 音声処理中、要約生成中はテキストエリアを無効化
+          disabled={isProcessingAudio || isGeneratingSummary}
           className="block w-full px-4 py-3 text-lg border border-gray-300 rounded-xl shadow-inner focus:ring-indigo-500 focus:border-indigo-500 bg-white placeholder-gray-500"
           placeholder="録音されたフィードバックがテキスト化されてここに入ります。必要に応じて直接編集も可能です。"
         ></textarea>
@@ -360,13 +413,13 @@ const FeedbackForm = ({ onSubmit }) => {
       <button
         type="submit"
         className={`w-full py-4 px-4 rounded-xl text-xl font-bold text-white transition duration-150 shadow-lg mt-8 ${
-          isSubmitting || isProcessingAudio // 音声処理中も送信を無効化
+          isSubmitting || isProcessingAudio || isGeneratingSummary // 処理中は送信を無効化
             ? "bg-gray-400 cursor-not-allowed"
             : "bg-indigo-600 hover:bg-indigo-700"
         }`}
-        disabled={isSubmitting || isProcessingAudio}
+        disabled={isSubmitting || isProcessingAudio || isGeneratingSummary}
       >
-        {isSubmitting ? "送信中..." : "送信"}
+        {isSubmitting || isGeneratingSummary ? "処理中..." : "送信"}
       </button>
     </form>
   );

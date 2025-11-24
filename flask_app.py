@@ -2,7 +2,7 @@ import os
 import json
 import psycopg2
 import base64
-import requests # ★★★ 実際のAPIコールに使用するために追加 ★★★
+import requests 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # -------------------------------------------------------------
-# ★★★ IndentationErrorを修正したデバッグコード ★★★ 
+# デバッグコード
 # -------------------------------------------------------------
 debug_key = os.environ.get('GEMINI_API_KEY')
 if debug_key:
@@ -134,121 +134,116 @@ def get_feedback_by_email(email):
             conn.close()
 
 # -------------------------------------------------------------
-# Gemini API呼び出し関数 (ペイロード構造を修正)
+# Gemini API呼び出しユーティリティ (共通処理)
 # -------------------------------------------------------------
-def call_gemini_api_for_stt_and_summary(base64_audio_data, prompt, mime_type):
-    """
-    Base64エンコードされた音声データを受け取り、Gemini APIを呼び出して
-    STT（音声認識）と要約を同時に行います。
-    """
-    print(f"🚀 Gemini APIに音声データ ({len(base64_audio_data)} bytes) を送信中...")
-    
+def _call_gemini_api_base(payload, error_prefix):
+    """共通のGemini API呼び出しロジックとエラー処理を扱います。"""
     API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent"
-    
     gemini_api_key = os.environ.get('GEMINI_API_KEY')
     if not gemini_api_key:
-        print("❌ GEMINI_API_KEYが設定されていません。STT/要約をスキップします。")
-        return {
-            "stt_text": "【STTエラー: APIキーが設定されていません。】",
-            "summary": "要約なし"
-        }
+        print("❌ GEMINI_API_KEYが設定されていません。処理をスキップします。")
+        raise Exception("APIキーが設定されていません。")
 
     headers = {'Content-Type': 'application/json'}
     
-    # ★★★ 修正箇所: systemInstructionとtoolsをトップレベルに移動 ★★★
-    payload = {
-        # 1. コンテンツ (プロンプトとオーディオ)
-        "contents": [
-            {
-                "parts": [
-                    # A. プロンプト (テキスト)
-                    {"text": prompt},
-                    # B. オーディオデータ (マルチモーダル)
-                    {"inlineData": {"mimeType": mime_type, "data": base64_audio_data}}
-                ]
-            }
-        ],
-        
-        # 2. システム指示 (トップレベルに移動)
-        "systemInstruction": {
-            "parts": [{"text": "You are a professional feedback analyst. Accurately transcribe the audio content (STT) and then summarize the key feedback (positive points and suggestions) in Japanese, under 30 characters."}]
-        },
-        
-        # 3. ツール (トップレベルに移動)
-        "tools": [{"google_search": {} }] 
-        # configキー自体は削除
-    }
-    # ★★★ 修正箇所ここまで ★★★
-
     try:
-        # APIキーを使ってリクエストを送信
         response = requests.post(
             f"{API_URL}?key={gemini_api_key}", 
             headers=headers, 
             json=payload,
-            timeout=30 # タイムアウトを設定
+            timeout=30
         )
-        response.raise_for_status() # HTTPエラーコード（4xx, 5xx）を検出
+        response.raise_for_status()
 
         result = response.json()
-        
-        # 応答のパース
         generated_text = result.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', '')
         
         if not generated_text:
             raise Exception("Gemini APIからの応答テキストが空でした。")
 
-        # シンプルなロジックでSTTと要約を分離
-        # 生成されたテキスト全体を STT結果として採用
-        stt_text = generated_text
-        
-        # 要約は、生成されたテキストの最初の30文字を暫定的に使用（プロンプトの指示に依存）
-        summary_text = stt_text.split('\n')[0][:30].strip()
-        if not summary_text:
-             summary_text = stt_text.strip()[:30]
-
-
-        print("✅ Gemini APIからの応答を受信しました。")
-        return {
-            "stt_text": stt_text,
-            "summary": summary_text
-        }
+        print(f"✅ Gemini APIからの応答を受信しました: {error_prefix}")
+        return generated_text
 
     except requests.exceptions.HTTPError as http_err:
         status_code = http_err.response.status_code if http_err.response is not None else "Unknown"
-        print(f"❌ HTTPエラーが発生しました: {http_err} (Status: {status_code})")
-        # エラー詳細をより詳しくログに出力
+        error_detail = "APIエラー: 詳細不明"
         try:
+             # エラーメッセージをJSONから抽出
              error_response = http_err.response.json()
              error_detail = f"APIエラー: {error_response.get('error', {}).get('message', '詳細不明')} (Status: {status_code})"
         except:
              error_detail = http_err.response.text[:100] if http_err.response else "API応答なし"
-
-        return {
-            "stt_text": f"【STTエラー: HTTP {status_code}】",
-            "summary": f"APIエラー: {error_detail}..."
-        }
+        print(f"❌ HTTPエラーが発生しました: {http_err} (Status: {status_code})")
+        raise Exception(error_detail)
     except requests.exceptions.RequestException as req_err:
         print(f"❌ リクエストエラーが発生しました: {req_err}")
-        return {
-            "stt_text": f"【STTエラー: ネットワーク接続】",
-            "summary": f"ネットワークエラー: {req_err}"
-        }
+        raise Exception(f"ネットワークエラー: {req_err}")
     except Exception as e:
-        print(f"❌ 応答パースエラー: {e}")
-        return {
-            "stt_text": f"【STTエラー: 応答解析失敗】",
-            "summary": f"応答解析エラー: {e}"
-        }
+        print(f"❌ {error_prefix}エラー: {e}")
+        raise Exception(f"{error_prefix}エラー: {e}")
 
 # -------------------------------------------------------------
-# 新規エンドポイント: POST /api/process_audio (変更なし)
+# STT専用のAPI呼び出し
+# -------------------------------------------------------------
+def call_gemini_api_for_stt(base64_audio_data, prompt, mime_type):
+    """Base64エンコードされた音声データを受け取り、Gemini APIを呼び出してSTTのみを行います。"""
+    print(f"🚀 Gemini APIに音声データ ({len(base64_audio_data)} bytes) を送信中 (STT専用)...")
+    
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt},
+                    {"inlineData": {"mimeType": mime_type, "data": base64_audio_data}}
+                ]
+            }
+        ],
+        "systemInstruction": {
+            "parts": [{"text": "You are a professional transcriber. Accurately transcribe the audio content (STT) in Japanese. Do not add any summary or extra text."}]
+        },
+        "tools": [{"google_search": {} }]
+    }
+    
+    try:
+        stt_text = _call_gemini_api_base(payload, "STT")
+        return {"stt_text": stt_text}
+    except Exception as e:
+        # 例外メッセージをSTTエラーとして返す
+        return {"stt_text": f"【STTエラー: {e}】"}
+
+# -------------------------------------------------------------
+# 要約専用のAPI呼び出し
+# -------------------------------------------------------------
+def call_gemini_api_for_summary(raw_text):
+    """テキストを受け取り、Gemini APIを呼び出して要約を行います。"""
+    print("🚀 Gemini APIにテキストを送信中 (要約専用)...")
+    
+    # ここでのpromptはシステム指示ではなく、ユーザーコンテンツとして使用
+    prompt = f"以下のフィードバックテキストを読み、ポジティブな点と改善点を抽出し、30文字以内の簡潔な日本語で要約してください。\n\nテキスト:\n{raw_text}"
+    
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "systemInstruction": {
+            "parts": [{"text": "You are a professional feedback analyst. Summarize the user-provided text in Japanese, focusing on key positive and negative points, strictly under 30 characters. Do not include any introduction or closing phrases."}]
+        },
+        # テキスト処理のためtoolsは省略
+    }
+    
+    try:
+        summary_text = _call_gemini_api_base(payload, "要約")
+        return {"summary_text": summary_text.strip()}
+    except Exception as e:
+        # 例外メッセージを要約エラーとして返す
+        return {"summary_text": f"【要約エラー: {e}】"}
+
+# -------------------------------------------------------------
+# エンドポイント: POST /api/process_audio (STTのみを返すように更新)
 # -------------------------------------------------------------
 @app.route('/api/process_audio', methods=['POST'])
 def process_audio():
     """
-    クライアントから送られたBase64エンコードのPCMオーディオデータを受け取り、
-    Gemini APIでテキスト化と要約を実行します。
+    クライアントから送られたBase64エンコードのオーディオデータを受け取り、
+    Gemini APIでテキスト化（STT）のみを実行します。
     """
     try:
         data = request.json
@@ -262,37 +257,60 @@ def process_audio():
     if not base64_audio or not mime_type or not booth_id:
         return jsonify({"message": "❌ 必須データ（audio_data, mime_type, booth_id）が不足しています"}), 400
 
-    # 1. Gemini API呼び出し用のプロンプトを作成
-    # システム指示はcall_gemini_api_for_stt_and_summary関数内でより具体的に指定するため、ここでは単にタスクを指示
-    prompt_text = f"ブースID {booth_id} へのフィードバックをテキスト化し、要約してください。"
+    prompt_text = f"ブースID {booth_id} へのフィードバックをテキスト化してください。"
     
     try:
-        # 2. Gemini APIを呼び出し（ここでは実処理）
-        gemini_result = call_gemini_api_for_stt_and_summary(
-            base64_audio, 
-            prompt_text, # 以前のsystem_promptをprompt_textとして渡す
-            mime_type
-        )
-        
+        # call_gemini_api_for_stt を使用
+        gemini_result = call_gemini_api_for_stt(base64_audio, prompt_text, mime_type)
         stt_text = gemini_result["stt_text"]
-        summary_text = gemini_result["summary"]
 
         return jsonify({
             "message": "✅ 音声処理成功",
-            "stt_text": stt_text,
-            "summary_text": summary_text
+            "stt_text": stt_text
         }), 200
 
     except Exception as e:
-        error_detail = f"Gemini API呼び出しまたは処理中のエラー: {e}"
+        error_detail = f"音声処理中のエラー: {e}"
         print(f"❌ {error_detail}")
         return jsonify({
             "message": "❌ サーバーでの音声処理に失敗しました。",
             "error_detail": error_detail
         }), 500
 
+# -------------------------------------------------------------
+# 新規エンドポイント: POST /api/generate_summary (テキストから要約を生成)
+# -------------------------------------------------------------
+@app.route('/api/generate_summary', methods=['POST'])
+def generate_summary():
+    """クライアントから送られたテキストを受け取り、Gemini APIで要約を生成します。"""
+    try:
+        data = request.json
+        raw_text = data.get('raw_text')
+        if not raw_text:
+            return jsonify({"message": "❌ 必須データ（raw_text）が不足しています"}), 400
+            
+    except Exception as e:
+        return jsonify({"message": "❌ 無効なJSONデータ", "error_detail": str(e)}), 400
+        
+    try:
+        gemini_result = call_gemini_api_for_summary(raw_text)
+        summary_text = gemini_result["summary_text"]
+        
+        return jsonify({
+            "message": "✅ 要約生成成功",
+            "summary_text": summary_text
+        }), 200
+
+    except Exception as e:
+        error_detail = f"要約生成中のエラー: {e}"
+        print(f"❌ {error_detail}")
+        return jsonify({
+            "message": "❌ サーバーでの要約生成に失敗しました。",
+            "error_detail": error_detail
+        }), 500
+
 # =========================================================================
-# 既存のエンドポイント: POST /api/submit_feedback (変更なし)
+# 既存のエンドポイント: POST /api/submit_feedback (要約を受け付けて保存するように更新)
 # =========================================================================
 @app.route('/api/submit_feedback', methods=['POST'])
 def submit_feedback():
@@ -315,6 +333,7 @@ def submit_feedback():
     booth_id = data.get('booth_id')
     raw_text = data.get('raw_text')
     visitor_attribute = data.get('visitor_attribute')
+    summary_text = data.get('summary_text', "") # ★★★ 修正: summary_textを受け取る ★★★
     
     try:
         praise_ratio = float(data.get('praise_ratio', 0))
@@ -327,6 +346,9 @@ def submit_feedback():
         conn.close()
         return jsonify({"message": "❌ 必須フィールドが不足しています"}), 400
 
+    # summary_textがあれば、is_processedをTrueにする
+    is_processed = bool(summary_text and summary_text != "") # ★★★ 修正: summary_textがあればTrueにする ★★★
+
     cursor = conn.cursor()
     inserted_id = None
     
@@ -338,15 +360,14 @@ def submit_feedback():
             RETURNING id;
         """
         
-        # 挿入時にメールアドレスとbooth_idを小文字化して保存する（検索効率のため）
         params = (
             booth_id.lower().strip(), 
             praise_ratio, 
             advice_ratio, 
             raw_text, 
-            visitor_attribute.lower().strip(), # 訪問者のメール/属性として保存
-            "",  
-            False 
+            visitor_attribute.lower().strip(), 
+            summary_text,  # ★★★ 修正: 受け取ったsummary_textを保存 ★★★
+            is_processed   # ★★★ 修正: is_processedを更新 ★★★
         )
         
         cursor.execute(sql, params)
