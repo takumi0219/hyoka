@@ -35,7 +35,8 @@ def get_db_connection():
         return None, "DATABASE_URLが設定されていません。"
 
     try:
-        conn = psycopg2.connect(database_url)
+        # 接続タイムアウトを設定
+        conn = psycopg2.connect(database_url, connect_timeout=5)
         return conn, None
     except Exception as e:
         error_message = f"データベース接続エラー: {e}"
@@ -43,13 +44,14 @@ def get_db_connection():
         return None, error_message
 
 # =========================================================================
-# 既存のエンドポイント: GET /api/feedback/<email> (変更なし)
+# 既存のエンドポイント: GET /api/feedback/<email> (全件取得と属性の追加)
 # =========================================================================
 @app.route('/api/feedback/<email>', methods=['GET'])
 def get_feedback_by_email(email):
     """
     学生のメールアドレス（students.email）を起点として、所属チームのブースIDに紐づく
-    フィードバックデータ（sessions）をデータベースから取得します。
+    フィードバックデータ（sessions）をデータベースから**全件**取得します。
+    また、全チームの総数とチームメンバーリストも同時に取得します。
     """
     search_email = email.lower().strip() 
 
@@ -62,52 +64,124 @@ def get_feedback_by_email(email):
     cursor = conn.cursor()
     
     try:
-        sql = """
+        # 1. チーム名とブースIDを学生テーブルから取得
+        team_info_sql = """
             SELECT 
-                s.booth_id, 
+                t.team_name,
+                t.booth_id
+            FROM 
+                public.students t
+            WHERE 
+                TRIM(LOWER(t.email)) = %s;
+        """
+        cursor.execute(team_info_sql, (search_email,))
+        team_result = cursor.fetchone()
+
+        if not team_result:
+            print(f"⚠️ No student found for email: {search_email}. Returning 404.")
+            return jsonify({
+                "message": f"メールアドレス {search_email} に紐づく学生情報が見つかりません。",
+                "score": None
+            }), 404
+            
+        team_name, booth_id = team_result
+        
+        # 2. ★★★ 該当チームのメンバーリストを取得 ★★★
+        # team_name でフィルタリングし、全メンバーを取得
+        team_members_sql = """
+            SELECT 
+                s.full_name, 
+                s.email
+            FROM 
+                public.students s
+            WHERE 
+                TRIM(LOWER(s.team_name)) = %s;
+        """
+        # ★★★ 修正: team_name を引数として渡す ★★★
+        cursor.execute(team_members_sql, (team_name.lower().strip(),))
+        member_results = cursor.fetchall()
+
+        team_members_list = []
+        for name, member_email in member_results:
+             # 現在ログインしているユーザーを特定するために、メールアドレスを保持
+            is_current_user = (member_email.lower().strip() == search_email)
+            team_members_list.append({
+                "name": name,
+                "email": member_email,
+                "is_current_user": is_current_user
+            })
+
+        # 3. 全チームの総数を取得
+        total_teams_sql = "SELECT COUNT(DISTINCT team_name) FROM public.students;"
+        cursor.execute(total_teams_sql)
+        total_teams_count = cursor.fetchone()[0] if cursor.rowcount else 0
+
+        # 4. 該当ブースIDの全セッションデータを取得 (visitor_attributeを追加)
+        sessions_sql = """
+            SELECT 
                 s.raw_text, 
                 s.summary_text, 
                 s.is_processed,
-                t.team_name,
-                t.email
+                s.visitor_attribute,
+                s.praise_ratio, 
+                s.advice_ratio
             FROM 
                 public.sessions s
-            INNER JOIN 
-                public.students t ON TRIM(LOWER(s.booth_id)) = TRIM(LOWER(t.booth_id))
             WHERE 
-                TRIM(LOWER(t.email)) = %s -- studentsテーブルのメールアドレスでフィルタ
+                TRIM(LOWER(s.booth_id)) = %s 
             ORDER BY 
-                s.id DESC 
-            LIMIT 1;
+                s.id DESC;
         """
         
-        cursor.execute(sql, (search_email,))
-        result = cursor.fetchone()
+        cursor.execute(sessions_sql, (booth_id.lower().strip(),))
+        session_results = cursor.fetchall()
+
+        feedback_list = []
+        total_score = 0
         
-        if result:
-            booth_id, raw_text, summary_text, is_processed, team_name, student_email = result
-            
+        for raw_text, summary_text, is_processed, visitor_attribute, praise_ratio, advice_ratio in session_results:
+            # スコアは、is_processedに応じて暫定的に算出
+            # （本来はAI処理で算出すべきだが、現状は仮のロジック）
             score = 85 if is_processed else 50 
+            total_score += score
             
-            response_data = {
+            feedback_list.append({
+                "raw_text": raw_text,
+                "summary_text": summary_text,
+                "visitor_attribute": visitor_attribute,
+                "score": score,
+                "is_processed": is_processed,
+                "praise_ratio": praise_ratio,
+                "advice_ratio": advice_ratio
+            })
+
+        average_score = round(total_score / len(feedback_list)) if feedback_list else None
+        
+        response_data = {
+            "team_name": team_name,
+            "booth_id": booth_id,
+            "total_count": len(feedback_list),
+            "total_teams_count": total_teams_count, 
+            "average_score": average_score, # 全フィードバックの平均スコア
+            "team_members": team_members_list, # ★★★ ここで追加 ★★★
+            "feedbacks": feedback_list # 全フィードバックのリスト
+        }
+        
+        if not feedback_list:
+             print(f"⚠️ No feedback data found for team booth: {booth_id}. Returning 200 (No data).")
+             # データがない場合も200で返す（学生情報は取得できているため）
+             return jsonify({
+                "message": f"まだフィードバックがありません。ブースID {booth_id} のフィードバックを収集してください。",
                 "team_name": team_name,
                 "booth_id": booth_id,
-                "score": score,
-                "comments": [
-                    "取得したraw_text: " + raw_text[:50] + ("..." if len(raw_text) > 50 else ""),
-                    "サマリー: " + (summary_text if summary_text else "サマリーテキストはまだ生成されていません。"),
-                    f"データ処理ステータス: {'完了' if is_processed else '未処理'}",
-                    f"学生メール: {student_email}"
-                ]
-            }
-            
-            return jsonify(response_data), 200
-        else:
-            print(f"⚠️ No data found for student email: {search_email}. Returning 404.")
-            return jsonify({
-                "message": f"まだプレゼンテーションを行っていないので、データがありません。プレゼンテーションを行い、フィードバックを収集してください。",
-                "score": None 
-            }), 404
+                "total_count": 0,
+                "total_teams_count": total_teams_count, 
+                "average_score": None,
+                "team_members": team_members_list, # ★★★ ここで追加 ★★★
+                "feedbacks": []
+            }), 200
+        
+        return jsonify(response_data), 200
             
     except psycopg2.Error as db_err:
         conn.rollback()
